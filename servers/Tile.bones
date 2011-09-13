@@ -18,7 +18,7 @@ server = Bones.Server.extend({
     },
 
     initializeRoutes: function() {
-        _.bindAll(this, 'load', 'tile', 'grid', 'layer', 'download', 'status');
+        _.bindAll(this, 'load', 'loadOverlay', 'tile', 'compositeTile', 'grid', 'layer', 'download', 'status');
 
         this.param('tileset', this.load);
 
@@ -26,6 +26,8 @@ server = Bones.Server.extend({
         this.get('/:version(1|2).0.0/:tileset/:z/:x/:y.(png|jpg|jpeg)', this.tile);
         this.get('/:version(1|2).0.0/:tileset/:z/:x/:y.grid.json', this.grid);
         this.get('/:version(1|2).0.0/:tileset/layer.json', this.layer);
+        // composite endpoints.
+        this.get('/:version(1|2).0.0/:tileset/:overlay/:z/:x/:y.(png|jpg|jpeg)', this.loadOverlay, this.compositeTile);
 
         this.get('/download/:tileset.mbtiles', this.download);
 
@@ -79,6 +81,26 @@ server = Bones.Server.extend({
         });
     },
 
+    // Route middleware. Validate and load an mbtiles overlay file
+    loadOverlay: function(req, res, next) {
+        var id = req.param('overlay');
+        if (!this.validTilesetID(id)) {
+            return next(new Error.HTTP('Tileset does not exist', 404));
+        }
+
+        var model = new models.Tileset({ id: id }, req.query);
+        model.fetch({
+            success: function(model) {
+                res.overlay = model;
+                next();
+            },
+            error: function(model, err) {
+                err.status = 404;
+                next(err);
+            }
+        });
+    },
+
     // MBTiles download.
     // @TODO: Current `maxAge` option is hardcoded into place. Find better
     // way to pass this through.
@@ -110,6 +132,41 @@ server = Bones.Server.extend({
             } else {
                 _.extend(headers, options || {});
                 res.send(tile, headers);
+            }
+        });
+    },
+
+    // Composite Tile Endpoint
+    compositeTile: function(req, res, next) {
+        gd = require('gd');
+        var z = req.param('z'), x = req.param('x'), y = req.param('y');
+
+        // 1.0.0: incoming request TMS => tilesource XYZ
+        // 2.0.0: incoming request XYZ => tilesource XYZ
+        if (req.param('version') === '1') y = Math.pow(2, z) - 1 - y;
+
+        var headers = _.clone(this.config.header);
+        res.model.source.getTile(z, x, y, function(err, tile, options) {
+            if (err) {
+                err.status = 404;
+                next(err);
+            } else {
+                _.extend(headers, options || {});
+                res.overlay.source.getTile(z, x, y, function(err, otile, options) {
+		    // ugly hack to avoid the gd code when the overlay tile is blank.
+                    var empty = "iVBORw0KGgoAAAANSUhEUgAAAQAAAAEAAQMAAABmvDolAAAAA1BMVEUAAACnej3aAAAAAXRSTlMAQObYZgAAAB9JREFUaIHtwQENAAAAwqD3T20ON6AAAAAAAAAAAL4NIQAAAZpg4dUAAAAASUVORK5CYII="
+                    if (err || otile.toString('base64') == empty) {
+                        res.send(tile, headers);
+                    } else {
+                        var base = gd.createFromPngPtr(tile.toString('binary'));
+                        var overlay = gd.createFromPngPtr(otile.toString('binary'));
+			var target = gd.createTrueColor(base.width, base.height); 
+                        base.copy(target,0,0,0,0,base.width,base.height);
+                        overlay.copy(target,0,0,0,0,overlay.width,overlay.height);
+                        var composite = new Buffer(target.pngPtr(), 'binary');
+                        res.send(composite, headers);
+                    }
+                });
             }
         });
     },
